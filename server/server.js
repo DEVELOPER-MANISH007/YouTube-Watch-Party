@@ -5,6 +5,8 @@ const cors = require("cors");
 const express = require("express");
 const connectDatabase = require("./config/database");
 const healthRoutes = require("./routes/health.routes");
+const roomRoutes = require("./routes/room.routes");
+const errorHandler = require("./middleware/errorHandler");
 const initializeSocket = require("./socket");
 
 const app = express();
@@ -15,6 +17,8 @@ const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
 app.use(cors({ origin: clientUrl }));
 app.use(express.json());
 app.use("/api/health", healthRoutes);
+app.use("/api/rooms", roomRoutes);
+app.use(errorHandler);
 
 initializeSocket(server, clientUrl);
 
