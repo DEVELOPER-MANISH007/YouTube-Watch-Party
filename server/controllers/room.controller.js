@@ -67,6 +67,7 @@ async function joinRoom(request, response) {
   if (!username) return fail(response, 400, "INVALID_USERNAME", "Enter a name between 1 and 32 characters.");
   const room = await Room.findOne({ roomCode }).select("+participants.sessionTokenHash");
   if (!room) return fail(response, 404, "ROOM_NOT_FOUND", "Room not found. Check the code with your host.");
+  if (room.sessionEndedAt) return fail(response, 410, "SESSION_ENDED", "This watch party session has ended.");
   const duplicate = room.participants.some((person) => person.isOnline
     && person.username.toLocaleLowerCase() === username.toLocaleLowerCase());
   if (duplicate) return fail(response, 409, "USERNAME_IN_USE", "That name is already being used by someone currently in this room.");

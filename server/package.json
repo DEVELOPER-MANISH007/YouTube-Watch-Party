@@ -5,12 +5,14 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "check:db": "node scripts/checkDatabase.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
-    "express": "^5.1.0",
+    "express": "^5.2.1",
+    "mongodb": "^7.7.0",
     "mongoose": "^8.13.2",
     "socket.io": "^4.8.1"
   },

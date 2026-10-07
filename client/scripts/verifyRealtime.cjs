@@ -10,6 +10,7 @@ const { io } = require("socket.io-client");
 const API = process.env.VITE_API_URL || `http://localhost:${process.env.PORT || 5000}`;
 const sockets = [];
 let testRoomCode;
+const testRoomCodes = [];
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function nextEvent(socket, name, timeout = 6000) {
@@ -56,6 +57,18 @@ async function connectMember(roomCode, sessionToken) {
   return { socket, initialSync: await syncPromise };
 }
 
+async function connectBareSocket() {
+  const socket = io(API, { autoConnect: false, transports: ["websocket"] });
+  sockets.push(socket);
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Timed out connecting to Socket.IO server.")), 6000);
+    socket.once("connect", () => { clearTimeout(timer); resolve(); });
+    socket.once("connect_error", (error) => { clearTimeout(timer); reject(error); });
+    socket.connect();
+  });
+  return socket;
+}
+
 async function run() {
   if (!process.env.MONGODB_URI) throw new Error("MONGODB_URI is required in server/.env for the realtime verification.");
   await mongoose.connect(process.env.MONGODB_URI);
@@ -67,6 +80,7 @@ async function run() {
   const created = await request("/api/rooms", { username: "Realtime Host", videoId: "dQw4w9WgXcQ" });
   assert.equal(created.status, 201, JSON.stringify(created.body));
   testRoomCode = created.body.room.roomCode;
+  testRoomCodes.push(testRoomCode);
   assert.match(testRoomCode, /^[A-Z0-9]{5}-[A-Z0-9]{5}$/, "Room codes must be generated in the expected format.");
   assert.equal(created.body.room.currentUser.role, "host", "Room creator must be Host.");
   const host = await connectMember(testRoomCode, created.body.sessionToken);
@@ -198,6 +212,11 @@ async function run() {
   assert.equal(removal.ok, true);
   assert.equal((await guestRemoved).userId, guest.initialSync.currentUser.userId);
   assert.equal((await hostRemoved).participants.length, 2, "Removed participant must be deleted from the room list.");
+  const removedSocket = await connectBareSocket();
+  const removedReconnect = await emitAck(removedSocket, "join_room", { roomCode: testRoomCode, sessionToken: firstJoin.body.sessionToken });
+  assert.equal(removedReconnect.ok, false, "A removed session must not reconnect to the room.");
+  assert.equal(removedReconnect.error.code, "ROOM_NOT_FOUND");
+  removedSocket.disconnect();
   const removeHost = await emitAck(host.socket, "remove_participant", { userId: host.initialSync.currentUser.userId });
   assert.equal(removeHost.ok, false, "Host cannot remove themself.");
 
@@ -228,7 +247,119 @@ async function run() {
     "A participant reusing an offline name must become an active room member.");
   assert.equal(afterNameReuse.body.room.participants.filter((person) => person.username === "Disconnect Guest").length, 1,
     "Only the online session should appear for a reused offline username.");
-  console.log("Realtime integration passed: authorization, role changes, late join, reconnect membership, ordered rapid playback and seek persistence, offline username reuse, removal, leave, disconnect, and MongoDB persistence.");
+
+  const makeRoom = async (hostName) => {
+    const result = await request("/api/rooms", { username: hostName });
+    assert.equal(result.status, 201, JSON.stringify(result.body));
+    testRoomCodes.push(result.body.room.roomCode);
+    const hostMember = await connectMember(result.body.room.roomCode, result.body.sessionToken);
+    return { code: result.body.room.roomCode, token: result.body.sessionToken, host: hostMember };
+  };
+  const makeGuest = async (code, username) => {
+    const joined = await request(`/api/rooms/${code}/join`, { username });
+    assert.equal(joined.status, 201, JSON.stringify(joined.body));
+    return { token: joined.body.sessionToken, ...(await connectMember(code, joined.body.sessionToken)) };
+  };
+
+  // A transferred Host is selected explicitly and can exercise Host-only actions;
+  // the old Host loses membership and cannot keep controlling the room.
+  for (const [newRole, suffix] of [["participant", "Participant"], ["moderator", "Moderator"]]) {
+    const transferRoom = await makeRoom(`Transfer Host ${suffix}`);
+    const candidate = await makeGuest(transferRoom.code, `Candidate ${suffix}`);
+    const other = await makeGuest(transferRoom.code, `Other ${suffix}`);
+    if (newRole === "moderator") {
+      assert.equal((await emitAck(transferRoom.host.socket, "assign_role", {
+        userId: candidate.initialSync.currentUser.userId, role: "moderator",
+      })).ok, true);
+    }
+    const beforePromotion = await emitAck(candidate.socket, "assign_role", {
+      userId: other.initialSync.currentUser.userId, role: "participant",
+    });
+    assert.equal(beforePromotion.ok, false, "Candidate must not have Host permissions before promotion.");
+    assert.equal(beforePromotion.error.code, "FORBIDDEN");
+    const playbackBefore = (await request(`/api/rooms/${transferRoom.code}`)).body.room;
+    const roleUpdate = nextEvent(candidate.socket, "role_assigned");
+    const transferred = await emitAck(transferRoom.host.socket, "transfer_host", { userId: candidate.initialSync.currentUser.userId });
+    assert.equal(transferred.ok, true, transferred.error?.message);
+    const receivedRoleUpdate = await roleUpdate;
+    assert.equal(receivedRoleUpdate.participant.userId, candidate.initialSync.currentUser.userId);
+    assert.equal(receivedRoleUpdate.participant.role, "host");
+    assert.ok(!receivedRoleUpdate.participants.some((person) => person.userId === transferRoom.host.initialSync.currentUser.userId),
+      "Old Host must leave the online room membership list after transfer.");
+    const oldHostControl = await emitAck(transferRoom.host.socket, "play", { currentTime: 99 });
+    assert.equal(oldHostControl.ok, false, "Old Host must lose control after explicitly leaving.");
+    assert.equal(oldHostControl.error.code, "NOT_IN_ROOM");
+    assert.equal((await emitAck(candidate.socket, "assign_role", {
+      userId: other.initialSync.currentUser.userId, role: "moderator",
+    })).ok, true, "Promoted participant must receive Host permissions.");
+    const playbackAfter = (await request(`/api/rooms/${transferRoom.code}`)).body.room;
+    assert.equal(playbackAfter.currentVideo, playbackBefore.currentVideo, "Host transfer must preserve video.");
+    assert.equal(playbackAfter.currentTime, playbackBefore.currentTime, "Host transfer must preserve playback position.");
+    assert.equal(playbackAfter.sessionEnded, false, "Host transfer must keep the session active.");
+    assert.equal((await emitAck(other.socket, "leave_room", {})).ok, true, "Participant leave should succeed.");
+    assert.ok((await request(`/api/rooms/${transferRoom.code}`)).body.room, "Participant leave must keep the room active.");
+    const moderatorJoin = await request(`/api/rooms/${transferRoom.code}/join`, { username: `Moderator Leave ${suffix}` });
+    assert.equal(moderatorJoin.status, 201);
+    const moderator = await connectMember(transferRoom.code, moderatorJoin.body.sessionToken);
+    assert.equal((await emitAck(candidate.socket, "assign_role", {
+      userId: moderator.initialSync.currentUser.userId, role: "moderator",
+    })).ok, true);
+    assert.equal((await emitAck(moderator.socket, "leave_room", {})).ok, true, "Moderator leave should succeed.");
+    assert.equal((await request(`/api/rooms/${transferRoom.code}`)).body.room.sessionEnded, false,
+      "Moderator leave must not end the room.");
+  }
+
+  // Empty rooms cannot transfer to a nonexistent participant.
+  const emptyRoom = await makeRoom("Empty Transfer Host");
+  const noCandidate = await emitAck(emptyRoom.host.socket, "transfer_host", { userId: "missing-user" });
+  assert.equal(noCandidate.ok, false, "Host cannot leave an ownerless active room.");
+  assert.equal(noCandidate.error.code, "HOST_NOT_ELIGIBLE");
+  assert.equal((await emitAck(emptyRoom.host.socket, "play", { currentTime: 1 })).ok, true,
+    "Host must remain in control when no transfer candidate exists.");
+
+  const unavailableRoom = await makeRoom("Available Host");
+  const unavailableCandidate = await makeGuest(unavailableRoom.code, "Departing Candidate");
+  unavailableCandidate.socket.disconnect();
+  await delay(100);
+  const staleTransfer = await emitAck(unavailableRoom.host.socket, "transfer_host", {
+    userId: unavailableCandidate.initialSync.currentUser.userId,
+  });
+  assert.equal(staleTransfer.ok, false, "A participant who left before confirmation cannot become Host.");
+  assert.equal(staleTransfer.error.code, "HOST_NOT_ELIGIBLE");
+  assert.equal((await emitAck(unavailableRoom.host.socket, "play", { currentTime: 2 })).ok, true,
+    "Host must retain control when a proposed transfer candidate becomes unavailable.");
+
+  // Explicit End Session notifies connected members, rejects reconnects and blocks
+  // further control from the ended room's former Host.
+  const endedRoom = await makeRoom("Ending Host");
+  const endedGuest = await makeGuest(endedRoom.code, "Ending Guest");
+  const endedNotice = nextEvent(endedGuest.socket, "session_ended");
+  assert.equal((await emitAck(endedRoom.host.socket, "end_session", {})).ok, true);
+  assert.equal((await endedNotice).reason, "host_ended");
+  const endedControl = await emitAck(endedRoom.host.socket, "play", { currentTime: 12 });
+  assert.equal(endedControl.ok, false, "Ended session must reject the former Host's control.");
+  const endedJoin = await request(`/api/rooms/${endedRoom.code}/join`, { username: "Late Joiner" });
+  assert.equal(endedJoin.status, 410, "Ended session must reject new room sessions.");
+  const oldGuestSocket = await connectBareSocket();
+  const endedReconnect = await emitAck(oldGuestSocket, "join_room", { roomCode: endedRoom.code, sessionToken: endedGuest.token });
+  assert.equal(endedReconnect.ok, false, "Participants cannot reconnect into an ended session.");
+  assert.equal(endedReconnect.error.code, "SESSION_ENDED");
+
+  // A host disconnect ends the session only after the existing reconnect check;
+  // ordinary non-host leave/disconnect above leaves the room active.
+  const disconnectedHostRoom = await makeRoom("Disconnecting Host");
+  const disconnectGuest = await makeGuest(disconnectedHostRoom.code, "Disconnect Host Guest");
+  const disconnectEndedNotice = nextEvent(disconnectGuest.socket, "session_ended");
+  disconnectedHostRoom.host.socket.disconnect();
+  assert.equal((await disconnectEndedNotice).reason, "host_disconnected");
+  const disconnectedHostJoin = await connectBareSocket();
+  const rejectedOldHost = await emitAck(disconnectedHostJoin, "join_room", {
+    roomCode: disconnectedHostRoom.code, sessionToken: disconnectedHostRoom.token,
+  });
+  assert.equal(rejectedOldHost.ok, false, "Old Host cannot revive a disconnected ended session.");
+  assert.equal(rejectedOldHost.error.code, "SESSION_ENDED");
+
+  console.log("Realtime integration passed: RBAC, manual Host transfer, explicit/disconnected Host session end, reconnect rejection, normal participant/moderator leave, playback ordering/persistence, removal, and reconnect race protection.");
 }
 
 run().catch((error) => {
@@ -236,6 +367,6 @@ run().catch((error) => {
   process.exitCode = 1;
 }).finally(async () => {
   for (const socket of sockets) socket.disconnect();
-  if (testRoomCode) await Room.deleteOne({ roomCode: testRoomCode }).catch(() => {});
+  if (testRoomCodes.length) await Room.deleteMany({ roomCode: { $in: testRoomCodes } }).catch(() => {});
   await mongoose.disconnect().catch(() => {});
 });

@@ -11,6 +11,8 @@ const participantSchema = new mongoose.Schema({
 const roomSchema = new mongoose.Schema({
   roomCode: { type: String, required: true, unique: true, uppercase: true, index: true },
   hostId: { type: String, required: true },
+  sessionEndedAt: { type: Date, default: null },
+  sessionEndReason: { type: String, default: null },
   currentVideoId: { type: String, default: null, match: /^[\w-]{11}$/ },
   isPlaying: { type: Boolean, default: false },
   currentTime: { type: Number, default: 0, min: 0 },

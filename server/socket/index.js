@@ -26,6 +26,14 @@ function membershipKey(roomCode, userId) {
   return `${roomCode}:${userId}`;
 }
 
+function withMembershipLocks(roomCode, userIds, operation) {
+  const keys = [...new Set(userIds)].sort().map((userId) => membershipKey(roomCode, userId));
+  const acquire = (index) => index === keys.length
+    ? operation()
+    : enqueueByKey(membershipQueues, keys[index], () => acquire(index + 1));
+  return acquire(0);
+}
+
 function normalizeCode(value) {
   if (typeof value !== "string") return null;
   const code = value.trim().toUpperCase().replace(/\s/g, "");
@@ -113,6 +121,30 @@ async function disconnectMember(io, socket, member) {
       // A reconnect queues its online update on the same key. Recheck after the
       // database read so a socket that appeared during this disconnect stays online.
       if (await hasActiveSocket()) return;
+      if (room.sessionEndedAt) {
+        participant.isOnline = false;
+        await room.save();
+        return;
+      }
+      if (room.hostId === participant.userId && participant.role === ROLES.HOST) {
+        await enqueueByKey(playbackQueues, member.roomCode, async () => {
+          const activeRoom = await Room.findOne({ roomCode: member.roomCode, hostId: member.userId, sessionEndedAt: null });
+          const activeHost = findParticipant(activeRoom, member.userId);
+          if (!activeRoom || !activeHost || activeHost.role !== ROLES.HOST) return;
+          activeRoom.sessionEndedAt = new Date();
+          activeRoom.sessionEndReason = "host_disconnected";
+          activeRoom.isPlaying = false;
+          activeHost.isOnline = false;
+          await activeRoom.save();
+          const timer = persistenceTimers.get(member.roomCode);
+          if (timer) clearTimeout(timer);
+          persistenceTimers.delete(member.roomCode);
+          const state = playbackCache.get(member.roomCode);
+          if (state) { state.isPlaying = false; queuePlaybackPersistence(member.roomCode, state, true); }
+          io.to(member.roomCode).emit("session_ended", { reason: "host_disconnected" });
+        });
+        return;
+      }
       participant.isOnline = false;
       await room.save();
       socket.to(member.roomCode).emit("user_left", {
@@ -138,6 +170,27 @@ async function disconnectMember(io, socket, member) {
   }
 }
 
+async function endSession(io, roomCode, userId) {
+  return enqueueByKey(playbackQueues, roomCode, async () => {
+    const room = await Room.findOneAndUpdate({
+      roomCode,
+      hostId: userId,
+      sessionEndedAt: null,
+      participants: { $elemMatch: { userId, role: ROLES.HOST, isOnline: true } },
+    }, { $set: { sessionEndedAt: new Date(), sessionEndReason: "host_ended", isPlaying: false } }, { new: true });
+    if (!room) {
+      return { ok: false, error: { code: "FORBIDDEN", message: "Only the current Host can end this session." } };
+    }
+    const timer = persistenceTimers.get(roomCode);
+    if (timer) clearTimeout(timer);
+    persistenceTimers.delete(roomCode);
+    const state = playbackCache.get(roomCode);
+    if (state) { state.isPlaying = false; queuePlaybackPersistence(roomCode, state, true); }
+    io.to(roomCode).emit("session_ended", { reason: "host_ended" });
+    return { ok: true };
+  });
+}
+
 function initializeSocket(server, clientUrl) {
   const io = new Server(server, {
     cors: { origin: clientUrl, methods: ["GET", "POST"] },
@@ -155,6 +208,7 @@ function initializeSocket(server, clientUrl) {
         const tokenHash = hashSessionToken(token);
         const room = await Room.findOne({ roomCode, "participants.sessionTokenHash": tokenHash }).select("+participants.sessionTokenHash");
         if (!room) return replyError(socket, ack, "ROOM_NOT_FOUND", "Room or room session not found. Join again with the room code.");
+        if (room.sessionEndedAt) return replyError(socket, ack, "SESSION_ENDED", "This watch party session has ended.");
         const participant = room.participants.find((person) => person.sessionTokenHash === tokenHash);
         if (!participant) return replyError(socket, ack, "ROOM_NOT_FOUND", "Room session not found. Join again with the room code.");
         if (socket.data.member && socket.data.member.roomCode !== roomCode) {
@@ -181,6 +235,7 @@ function initializeSocket(server, clientUrl) {
             .select("+participants.sessionTokenHash");
           const currentParticipant = currentRoom?.participants.find((person) => person.sessionTokenHash === tokenHash);
           if (!currentRoom || !currentParticipant) return { error: ["ROOM_NOT_FOUND", "Room session not found. Join again with the room code."] };
+          if (currentRoom.sessionEndedAt) return { error: ["SESSION_ENDED", "This watch party session has ended."] };
           const nameInUse = currentRoom.participants.some((person) => person.userId !== currentParticipant.userId
             && person.isOnline && person.username.toLocaleLowerCase() === currentParticipant.username.toLocaleLowerCase());
           if (nameInUse) return { error: ["USERNAME_IN_USE", "That name is already being used by someone currently in this room."] };
@@ -217,10 +272,87 @@ function initializeSocket(server, clientUrl) {
         if (typeof ack === "function") ack({ ok: true });
         return;
       }
+      const room = await Room.findOne({ roomCode: member.roomCode, hostId: member.userId });
+      if (room && findParticipant(room, member.userId)?.role === ROLES.HOST) {
+        return replyError(socket, ack, "HOST_TRANSFER_REQUIRED", "Choose a new Host or end the session before leaving.");
+      }
       socket.data.member = null;
       await socket.leave(member.roomCode);
       await disconnectMember(io, socket, member);
       if (typeof ack === "function") ack({ ok: true });
+    });
+
+    socket.on("end_session", async (_payload, ack) => {
+      const member = socket.data.member;
+      if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before ending its session.");
+      try {
+        const result = await endSession(io, member.roomCode, member.userId);
+        if (!result.ok) return replyError(socket, ack, result.error.code, result.error.message);
+        socket.data.member = null;
+        await socket.leave(member.roomCode);
+        if (typeof ack === "function") ack({ ok: true });
+      } catch (error) {
+        console.error("Could not end room session:", error.name || "Error");
+        replyError(socket, ack, "END_SESSION_FAILED", "Could not end this watch party session.");
+      }
+    });
+
+    socket.on("transfer_host", async (payload, ack) => {
+      const member = socket.data.member;
+      const targetUserId = payload?.userId;
+      if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before transferring Host.");
+      if (typeof targetUserId !== "string" || !targetUserId || targetUserId === member.userId) {
+        return replyError(socket, ack, "INVALID_HOST", "Select an eligible participant to become Host.");
+      }
+      try {
+        const transferred = await withMembershipLocks(member.roomCode, [member.userId, targetUserId], () =>
+          enqueueByKey(playbackQueues, member.roomCode, async () => {
+          const current = await Room.findOne({ roomCode: member.roomCode, hostId: member.userId, sessionEndedAt: null })
+            .select("+participants.sessionTokenHash");
+          const actor = findParticipant(current, member.userId);
+          const target = findParticipant(current, targetUserId);
+          if (!current || !actor || actor.role !== ROLES.HOST || !actor.isOnline) return null;
+          if (!target || !target.isOnline || ![ROLES.MODERATOR, ROLES.PARTICIPANT].includes(target.role)) return false;
+          const connected = await io.in(member.roomCode).fetchSockets();
+          if (!connected.some((candidate) => candidate.data.member?.roomCode === member.roomCode
+            && candidate.data.member?.userId === targetUserId)) return false;
+          const updated = await Room.findOneAndUpdate({
+            _id: current._id,
+            hostId: member.userId,
+            sessionEndedAt: null,
+            participants: { $all: [
+              { $elemMatch: { userId: member.userId, role: ROLES.HOST, isOnline: true } },
+              { $elemMatch: { userId: targetUserId, role: { $in: [ROLES.MODERATOR, ROLES.PARTICIPANT] }, isOnline: true } },
+            ] },
+          }, {
+            $set: {
+              hostId: targetUserId,
+              "participants.$[oldHost].role": ROLES.PARTICIPANT,
+              "participants.$[oldHost].isOnline": false,
+              "participants.$[newHost].role": ROLES.HOST,
+            },
+          }, {
+            arrayFilters: [{ "oldHost.userId": member.userId }, { "newHost.userId": targetUserId }],
+            new: true,
+          }).select("+participants.sessionTokenHash");
+          return updated || false;
+          }),
+        );
+        if (!transferred) {
+          const code = transferred === null ? "FORBIDDEN" : "HOST_NOT_ELIGIBLE";
+          const message = transferred === null ? "Only the current Host can transfer Host." : "That participant is no longer available to become Host. Choose someone else.";
+          return replyError(socket, ack, code, message);
+        }
+        const participants = participantsFor(transferred);
+        const newHost = participants.find((item) => item.userId === targetUserId);
+        io.to(member.roomCode).emit("role_assigned", { participant: newHost, participants });
+        socket.data.member = null;
+        await socket.leave(member.roomCode);
+        if (typeof ack === "function") ack({ ok: true, participants });
+      } catch (error) {
+        console.error("Host transfer failed:", error.name || "Error");
+        replyError(socket, ack, "HOST_TRANSFER_FAILED", "Could not transfer Host. Please try again.");
+      }
     });
 
     for (const action of [ACTIONS.PLAY, ACTIONS.PAUSE, ACTIONS.SEEK, ACTIONS.CHANGE_VIDEO]) {
@@ -235,7 +367,7 @@ function initializeSocket(server, clientUrl) {
             if (socket.data.member?.roomCode !== member.roomCode || socket.data.member?.userId !== member.userId) {
               return replyError(socket, ack, "NOT_IN_ROOM", "You are no longer an active room participant.");
             }
-            const room = await Room.findOne({ roomCode: member.roomCode });
+            const room = await Room.findOne({ roomCode: member.roomCode, sessionEndedAt: null });
             const actor = findParticipant(room, member.userId);
             if (!room || !actor || !actor.isOnline) return replyError(socket, ack, "NOT_IN_ROOM", "You are no longer an active room participant.");
             if (!canPerform(actor.role, action)) return replyError(socket, ack, "FORBIDDEN", "Your room role does not allow this action.");
@@ -277,7 +409,7 @@ function initializeSocket(server, clientUrl) {
       try {
         const member = socket.data.member;
         if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before changing participant roles.");
-        const room = await Room.findOne({ roomCode: member.roomCode }).select("+participants.sessionTokenHash");
+        const room = await Room.findOne({ roomCode: member.roomCode, sessionEndedAt: null }).select("+participants.sessionTokenHash");
         const actor = findParticipant(room, member.userId);
         if (!room || !actor || !actor.isOnline) return replyError(socket, ack, "NOT_IN_ROOM", "You are no longer an active room participant.");
         if (!canPerform(actor.role, ACTIONS.ASSIGN_ROLE)) return replyError(socket, ack, "FORBIDDEN", "Only the host can assign participant roles.");
@@ -299,7 +431,7 @@ function initializeSocket(server, clientUrl) {
       try {
         const member = socket.data.member;
         if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before removing participants.");
-        const room = await Room.findOne({ roomCode: member.roomCode }).select("+participants.sessionTokenHash");
+        const room = await Room.findOne({ roomCode: member.roomCode, sessionEndedAt: null }).select("+participants.sessionTokenHash");
         const actor = findParticipant(room, member.userId);
         if (!room || !actor || !actor.isOnline) return replyError(socket, ack, "NOT_IN_ROOM", "You are no longer an active room participant.");
         if (!canPerform(actor.role, ACTIONS.REMOVE_PARTICIPANT)) return replyError(socket, ack, "FORBIDDEN", "Only the host can remove participants.");

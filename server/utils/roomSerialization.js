@@ -10,6 +10,8 @@ function serializeRoom(room, currentUserId = null, now = Date.now()) {
   return {
     roomId: String(room._id),
     roomCode: room.roomCode,
+    sessionEnded: Boolean(room.sessionEndedAt),
+    sessionEndReason: room.sessionEndReason || null,
     currentVideo: room.currentVideoId || null,
     playbackState: room.isPlaying ? "playing" : "paused",
     currentTime: effectiveTime(room, now),

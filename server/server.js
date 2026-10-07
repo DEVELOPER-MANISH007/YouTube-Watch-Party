@@ -23,6 +23,9 @@ app.use(errorHandler);
 initializeSocket(server, clientUrl);
 
 async function startServer() {
+  if (process.env.NODE_ENV === "production" && !process.env.CLIENT_URL) {
+    throw new Error("CLIENT_URL must be set in production.");
+  }
   if (process.env.MONGODB_URI) {
     await connectDatabase(process.env.MONGODB_URI);
   } else if (process.env.NODE_ENV === "production") {
@@ -31,7 +34,7 @@ async function startServer() {
     console.warn("MONGODB_URI is not set; starting without a database connection.");
   }
 
-  server.listen(port, () => {
+  server.listen(port, "0.0.0.0", () => {
     console.log(`API and Socket.IO server listening on port ${port}`);
   });
 }

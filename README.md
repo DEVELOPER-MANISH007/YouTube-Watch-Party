@@ -47,3 +47,5 @@ starts without MongoDB in development, but requires it in production. Optional
 environment variables are `PORT` and `CLIENT_URL`.
 
 The API health check is available at `GET http://localhost:5000/api/health`.
+To test the MongoDB URI in `server/.env` directly, run `npm run check:db` from
+the `server` directory. The check does not print the URI or its credentials.

@@ -3,7 +3,7 @@ import { io } from "socket.io-client";
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
 let activeSocket = null;
 
-export function connectToRoom({ roomCode, userId, sessionToken, onSyncState, onUserJoined, onUserLeft, onRoleAssigned, onParticipantRemoved, onError, onRemoved }) {
+export function connectToRoom({ roomCode, userId, sessionToken, onSyncState, onUserJoined, onUserLeft, onRoleAssigned, onParticipantRemoved, onError, onRemoved, onSessionEnded }) {
   if (activeSocket) activeSocket.disconnect();
   const socket = io(API_URL, { autoConnect: false, transports: ["websocket", "polling"] });
   activeSocket = socket;
@@ -18,6 +18,7 @@ export function connectToRoom({ roomCode, userId, sessionToken, onSyncState, onU
   });
   socket.on("connect_error", () => onError?.({ message: "Could not connect to the room server. Retrying…" }));
   socket.on("session_replaced", (payload) => onRemoved?.(payload));
+  socket.on("session_ended", (payload) => onSessionEnded?.(payload));
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -26,7 +27,9 @@ export function connectToRoom({ roomCode, userId, sessionToken, onSyncState, onU
       settled = true;
       socket.disconnect();
       if (activeSocket === socket) activeSocket = null;
-      reject(new Error(error?.message || "Could not join the room."));
+      const joinError = new Error(error?.message || "Could not join the room.");
+      joinError.code = error?.code;
+      reject(joinError);
     };
     socket.on("connect", () => {
       socket.timeout(8000).emit("join_room", { roomCode, sessionToken }, (timeoutError, result) => {
