@@ -72,6 +72,18 @@ async function connectBareSocket() {
 async function run() {
   if (!process.env.MONGODB_URI) throw new Error("MONGODB_URI is required in server/.env for the realtime verification.");
   await mongoose.connect(process.env.MONGODB_URI);
+  const makeRoom = async (hostName) => {
+    const result = await request("/api/rooms", { username: hostName });
+    assert.equal(result.status, 201, JSON.stringify(result.body));
+    testRoomCodes.push(result.body.room.roomCode);
+    const hostMember = await connectMember(result.body.room.roomCode, result.body.sessionToken);
+    return { code: result.body.room.roomCode, token: result.body.sessionToken, host: hostMember };
+  };
+  const makeGuest = async (code, username) => {
+    const joined = await request(`/api/rooms/${code}/join`, { username });
+    assert.equal(joined.status, 201, JSON.stringify(joined.body));
+    return { token: joined.body.sessionToken, ...(await connectMember(code, joined.body.sessionToken)) };
+  };
 
   const invalidCreate = await request("/api/rooms", { username: "  ", videoId: null });
   assert.equal(invalidCreate.status, 400, "Server must reject a missing username.");
@@ -93,6 +105,75 @@ async function run() {
   let guest = await connectMember(testRoomCode, firstJoin.body.sessionToken);
   assert.equal(guest.initialSync.currentUser.role, "participant");
   assert.equal((await firstJoinedNotice).participants.length, 2);
+
+  const approvalPeer = await makeGuest(testRoomCode, "Approval Peer");
+  const stateBeforeApproval = (await request(`/api/rooms/${testRoomCode}`)).body.room;
+  let hostRequestList = nextEvent(host.socket, "pending_action_requests");
+  let guestRequestStatus = nextEvent(guest.socket, "action_request_status");
+  const requestToReject = await emitAck(guest.socket, "request_action", { action: "play", payload: { currentTime: 18 } });
+  assert.equal(requestToReject.ok, true, "Participant playback request should be accepted for review.");
+  const hostPending = await hostRequestList;
+  assert.equal(hostPending.length, 1, "Host must receive pending participant requests.");
+  assert.equal(hostPending[0].username, "Realtime Guest");
+  assert.equal((await guestRequestStatus).status, "pending", "Requester must see pending status.");
+  const unauthorizedApproval = await emitAck(approvalPeer.socket, "resolve_action_request", {
+    requestId: requestToReject.requestId, decision: "approve",
+  });
+  assert.equal(unauthorizedApproval.ok, false, "A Participant cannot approve another user's request.");
+  assert.equal(unauthorizedApproval.error.code, "FORBIDDEN");
+  const guestSelfApproval = await emitAck(guest.socket, "resolve_action_request", {
+    requestId: requestToReject.requestId, decision: "approve",
+  });
+  assert.equal(guestSelfApproval.ok, false, "A Participant cannot approve their own request.");
+  const rejectedStatus = nextEvent(guest.socket, "action_request_status");
+  assert.equal((await emitAck(host.socket, "resolve_action_request", {
+    requestId: requestToReject.requestId, decision: "reject",
+  })).ok, true, "Host must be able to reject a request.");
+  assert.equal((await rejectedStatus).status, "rejected", "Requester must receive rejection status.");
+  const afterReject = (await request(`/api/rooms/${testRoomCode}`)).body.room;
+  assert.equal(afterReject.currentVideo, stateBeforeApproval.currentVideo);
+  assert.equal(afterReject.playbackState, stateBeforeApproval.playbackState, "Rejection must not change playback.");
+  assert.equal(afterReject.currentTime, stateBeforeApproval.currentTime, "Rejection must not change playback position.");
+  assert.equal((await emitAck(host.socket, "resolve_action_request", {
+    requestId: requestToReject.requestId, decision: "approve",
+  })).error.code, "STALE_REQUEST", "A resolved request cannot be approved twice.");
+
+  for (const invalidRequest of [
+    { action: "remove_participant", payload: {} },
+    { action: "seek", payload: { time: -1 } },
+    { action: "change_video", payload: { videoId: "bad-id" } },
+  ]) {
+    const invalid = await emitAck(guest.socket, "request_action", invalidRequest);
+    assert.equal(invalid.ok, false, "Invalid playback requests must be rejected.");
+  }
+  const pendingForSelf = await emitAck(guest.socket, "request_action", { action: "seek", payload: { time: 22 } });
+  assert.equal(pendingForSelf.ok, true);
+  const approvedStatus = nextEvent(guest.socket, "action_request_status");
+  const syncFromApproval = nextEvent(guest.socket, "sync_state");
+  const hostApproval = await emitAck(host.socket, "resolve_action_request", {
+    requestId: pendingForSelf.requestId, decision: "approve",
+  });
+  assert.equal(hostApproval.ok, true, "Host approval should apply the requested playback action.");
+  assert.equal((await syncFromApproval).currentTime, 22, "Approved action must broadcast authoritative playback state.");
+  assert.equal((await approvedStatus).status, "approved");
+
+  const participantDeniedAfterRequest = await emitAck(guest.socket, "play", { currentTime: 19 });
+  assert.equal(participantDeniedAfterRequest.ok, false, "Creating a request must not grant direct playback permission.");
+  assert.equal(participantDeniedAfterRequest.error.code, "FORBIDDEN");
+
+  const cancelledRequest = await emitAck(approvalPeer.socket, "request_action", { action: "seek", payload: { time: 77 } });
+  assert.equal(cancelledRequest.ok, true);
+  const peerDisconnected = nextEvent(host.socket, "pending_action_requests");
+  approvalPeer.socket.disconnect();
+  const remainingRequests = await peerDisconnected;
+  assert.equal(remainingRequests.some((item) => item.requestId === cancelledRequest.requestId), false,
+    "Disconnecting requester must be removed from the pending list.");
+  const staleDisconnected = await emitAck(host.socket, "resolve_action_request", {
+    requestId: cancelledRequest.requestId, decision: "approve",
+  });
+  assert.equal(staleDisconnected.ok, false, "A disconnected participant request cannot later mutate playback.");
+  assert.equal(staleDisconnected.error.code, "STALE_REQUEST");
+
   const duplicateName = await request(`/api/rooms/${testRoomCode}/join`, { username: "Realtime Host" });
   assert.equal(duplicateName.status, 409, "Room join must reject a duplicate active username.");
 
@@ -107,12 +188,53 @@ async function run() {
     assert.equal(denied.error.code, "FORBIDDEN", `Participant ${event} should be rejected by server authorization.`);
   }
 
+  const roleChangeRequest = await emitAck(guest.socket, "request_action", { action: "pause", payload: {} });
+  assert.equal(roleChangeRequest.ok, true);
+  const roleChangeRequestStatus = nextEvent(guest.socket, "action_request_status");
   const hostRoleUpdate = nextEvent(host.socket, "role_assigned");
   const guestRoleUpdate = nextEvent(guest.socket, "role_assigned");
   const promotion = await emitAck(host.socket, "assign_role", { userId: guest.initialSync.currentUser.userId, role: "moderator" });
   assert.equal(promotion.ok, true);
   assert.equal((await hostRoleUpdate).participant.role, "moderator");
   await guestRoleUpdate;
+  assert.equal((await roleChangeRequestStatus).status, "cancelled", "Promotion out of Participant role cancels pending requests.");
+  const roleChangedStale = await emitAck(host.socket, "resolve_action_request", {
+    requestId: roleChangeRequest.requestId, decision: "approve",
+  });
+  assert.equal(roleChangedStale.ok, false, "A request made as a Participant cannot be approved after promotion.");
+  assert.equal(roleChangedStale.error.code, "STALE_REQUEST");
+  const moderatorRequester = await makeGuest(testRoomCode, "Moderator Requester");
+  const moderatorPending = nextEvent(guest.socket, "pending_action_requests");
+  const moderatorRequesterStatus = nextEvent(moderatorRequester.socket, "action_request_status");
+  const moderatorRequest = await emitAck(moderatorRequester.socket, "request_action", {
+    action: "change_video", payload: { videoId: "M7lc1UVf-VE" },
+  });
+  assert.equal(moderatorRequest.ok, true);
+  assert.equal((await moderatorPending)[0].requestId, moderatorRequest.requestId,
+    "Moderator must receive pending Participant requests.");
+  assert.equal((await moderatorRequesterStatus).status, "pending");
+  const moderatorSync = nextEvent(host.socket, "sync_state");
+  const requesterSync = nextEvent(moderatorRequester.socket, "sync_state");
+  const moderatorApprovedStatus = nextEvent(moderatorRequester.socket, "action_request_status");
+  const moderatorApproval = await emitAck(guest.socket, "resolve_action_request", {
+    requestId: moderatorRequest.requestId, decision: "approve",
+  });
+  assert.equal(moderatorApproval.ok, true, "Moderator with playback permission may approve a request.");
+  assert.equal((await moderatorSync).currentVideo, "M7lc1UVf-VE");
+  assert.equal((await requesterSync).currentVideo, "M7lc1UVf-VE");
+  assert.equal((await moderatorApprovedStatus).status, "approved");
+  const removedRequesterRequest = await emitAck(moderatorRequester.socket, "request_action", { action: "seek", payload: { time: 88 } });
+  assert.equal(removedRequesterRequest.ok, true);
+  const removedRequestStatus = nextEvent(moderatorRequester.socket, "action_request_status");
+  const removedNotice = nextEvent(moderatorRequester.socket, "participant_removed");
+  assert.equal((await emitAck(host.socket, "remove_participant", { userId: moderatorRequester.initialSync.currentUser.userId })).ok, true);
+  await removedNotice;
+  assert.equal((await removedRequestStatus).status, "cancelled", "Removing a requester must cancel its pending request.");
+  const removedRequestApproval = await emitAck(host.socket, "resolve_action_request", {
+    requestId: removedRequesterRequest.requestId, decision: "approve",
+  });
+  assert.equal(removedRequestApproval.ok, false, "A removed participant request cannot later mutate playback.");
+  assert.equal(removedRequestApproval.error.code, "STALE_REQUEST");
   const hostRoleAttempt = await emitAck(host.socket, "assign_role", { userId: host.initialSync.currentUser.userId, role: "host" });
   assert.equal(hostRoleAttempt.ok, false, "Host role must not be assignable to create a second host.");
   assert.equal(hostRoleAttempt.error.code, "INVALID_ROLE");
@@ -248,19 +370,6 @@ async function run() {
   assert.equal(afterNameReuse.body.room.participants.filter((person) => person.username === "Disconnect Guest").length, 1,
     "Only the online session should appear for a reused offline username.");
 
-  const makeRoom = async (hostName) => {
-    const result = await request("/api/rooms", { username: hostName });
-    assert.equal(result.status, 201, JSON.stringify(result.body));
-    testRoomCodes.push(result.body.room.roomCode);
-    const hostMember = await connectMember(result.body.room.roomCode, result.body.sessionToken);
-    return { code: result.body.room.roomCode, token: result.body.sessionToken, host: hostMember };
-  };
-  const makeGuest = async (code, username) => {
-    const joined = await request(`/api/rooms/${code}/join`, { username });
-    assert.equal(joined.status, 201, JSON.stringify(joined.body));
-    return { token: joined.body.sessionToken, ...(await connectMember(code, joined.body.sessionToken)) };
-  };
-
   // A transferred Host is selected explicitly and can exercise Host-only actions;
   // the old Host loses membership and cannot keep controlling the room.
   for (const [newRole, suffix] of [["participant", "Participant"], ["moderator", "Moderator"]]) {
@@ -296,6 +405,26 @@ async function run() {
     assert.equal(playbackAfter.currentVideo, playbackBefore.currentVideo, "Host transfer must preserve video.");
     assert.equal(playbackAfter.currentTime, playbackBefore.currentTime, "Host transfer must preserve playback position.");
     assert.equal(playbackAfter.sessionEnded, false, "Host transfer must keep the session active.");
+    const transferRequester = await makeGuest(transferRoom.code, `Transfer Requester ${suffix}`);
+    const transferRequestStatus = nextEvent(transferRequester.socket, "action_request_status");
+    const transferredHostRequests = nextEvent(candidate.socket, "pending_action_requests");
+    const transferRequest = await emitAck(transferRequester.socket, "request_action", { action: "seek", payload: { time: 31 } });
+    assert.equal(transferRequest.ok, true);
+    assert.ok((await transferredHostRequests).some((item) => item.requestId === transferRequest.requestId),
+      "The current Host must receive pending requests after Host transfer.");
+    assert.equal((await transferRequestStatus).status, "pending");
+    const transferApprovedStatus = nextEvent(transferRequester.socket, "action_request_status");
+    const oldHostRequestAction = await emitAck(transferRoom.host.socket, "resolve_action_request", {
+      requestId: transferRequest.requestId, decision: "approve",
+    });
+    assert.equal(oldHostRequestAction.ok, false, "The former Host cannot approve after transferring Host.");
+    const transferredSync = nextEvent(transferRequester.socket, "sync_state");
+    assert.equal((await emitAck(candidate.socket, "resolve_action_request", {
+      requestId: transferRequest.requestId, decision: "approve",
+    })).ok, true, "The new Host can approve pending requests.");
+    assert.equal((await transferredSync).currentTime, 31);
+    assert.equal((await transferApprovedStatus).status, "approved");
+    assert.equal((await emitAck(transferRequester.socket, "leave_room", {})).ok, true);
     assert.equal((await emitAck(other.socket, "leave_room", {})).ok, true, "Participant leave should succeed.");
     assert.ok((await request(`/api/rooms/${transferRoom.code}`)).body.room, "Participant leave must keep the room active.");
     const moderatorJoin = await request(`/api/rooms/${transferRoom.code}/join`, { username: `Moderator Leave ${suffix}` });
@@ -334,8 +463,12 @@ async function run() {
   const endedRoom = await makeRoom("Ending Host");
   const endedGuest = await makeGuest(endedRoom.code, "Ending Guest");
   const endedNotice = nextEvent(endedGuest.socket, "session_ended");
+  const endedRequest = await emitAck(endedGuest.socket, "request_action", { action: "pause", payload: {} });
+  assert.equal(endedRequest.ok, true);
+  const endedRequestStatus = nextEvent(endedGuest.socket, "action_request_status");
   assert.equal((await emitAck(endedRoom.host.socket, "end_session", {})).ok, true);
   assert.equal((await endedNotice).reason, "host_ended");
+  assert.equal((await endedRequestStatus).status, "session_ended", "Ending the room must cancel pending requests.");
   const endedControl = await emitAck(endedRoom.host.socket, "play", { currentTime: 12 });
   assert.equal(endedControl.ok, false, "Ended session must reject the former Host's control.");
   const endedJoin = await request(`/api/rooms/${endedRoom.code}/join`, { username: "Late Joiner" });
@@ -359,7 +492,7 @@ async function run() {
   assert.equal(rejectedOldHost.ok, false, "Old Host cannot revive a disconnected ended session.");
   assert.equal(rejectedOldHost.error.code, "SESSION_ENDED");
 
-  console.log("Realtime integration passed: RBAC, manual Host transfer, explicit/disconnected Host session end, reconnect rejection, normal participant/moderator leave, playback ordering/persistence, removal, and reconnect race protection.");
+  console.log("Realtime integration passed: RBAC, Participant action requests and Host/Moderator approval, rejection and stale-request handling, manual Host transfer, explicit/disconnected Host session end, reconnect rejection, normal participant/moderator leave, playback ordering/persistence, removal, and reconnect race protection.");
 }
 
 run().catch((error) => {

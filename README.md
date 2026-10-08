@@ -23,14 +23,14 @@ Playback and room membership are synchronized through Socket.IO. Room, participa
 |---|---|
 | **Room management** | Create a room; join with a room code or shared link; view online participants; leave a room; persist room/session state |
 | **Real-time playback** | Synchronize play, pause, seek, and video changes; send current state to late joiners; serialize playback actions per room |
-| **Roles and permissions** | Host, Moderator, and Participant roles, with server-checked permissions |
+| **Roles and permissions** | Host, Moderator, and Participant roles, with server-checked permissions; Participants can request playback/video changes for approval |
 | **Host management** | Assign or remove Moderator status; remove a participant; explicitly transfer Host to an online Participant or Moderator; end the session |
 | **Reliability** | Reconnect and disconnect handling; prevent removed participants from reconnecting with a removed session; allow a disconnected participant's username to be reused; notify remaining users when a session ends |
 | **YouTube** | Embed videos using the YouTube IFrame API; accept supported YouTube URLs and video IDs |
 
 ## Roles and permissions
 
-Playback permissions are enforced by the server. Only the Host can manage roles, remove participants, transfer Host, or end the session.
+Playback permissions are enforced by the server. Only the Host can manage roles, remove participants, transfer Host, or end the session. Participants can request play, pause, seek, and video changes; a Host or Moderator must approve each request before it is applied.
 
 | Feature | Host | Moderator | Participant |
 |---|:---:|:---:|:---:|
@@ -43,6 +43,8 @@ Playback permissions are enforced by the server. Only the Host can manage roles,
 | Transfer Host | ✅ | ❌ | ❌ |
 | End session | ✅ | ❌ | ❌ |
 | Watch video | ✅ | ✅ | ✅ |
+| Request playback/video change | ❌ | ❌ | ✅ |
+| Approve/reject Participant request | ✅ | ✅ | ❌ |
 
 ## Host leave and session flow
 
@@ -85,6 +87,7 @@ If the Host disconnects without transferring Host or ending the session, the ser
 - **REST API** handles room creation, joining, and room data.
 - **Socket.IO** handles real-time room membership, playback, and role events.
 - **The server** validates room sessions and permissions and is authoritative for shared playback state.
+- **Participant requests** remain transient in the backend process; Host/Moderator approval invokes the same server playback action path as direct controls.
 - **MongoDB** persists room, participant, role, and playback state.
 - **The YouTube IFrame API** renders the video in each user's browser.
 
@@ -104,6 +107,10 @@ Playback changes are serialized per room before being broadcast to connected use
 | `pause` | Request synchronized pause. |
 | `seek` | Request a synchronized seek to a playback time. |
 | `change_video` | Change the room's YouTube video. |
+| `request_action` | Submit a Participant's play, pause, seek, or video-change request for approval. It does not change playback. |
+| `resolve_action_request` | Approve or reject a pending request; only a current Host or Moderator may resolve it. |
+| `pending_action_requests` | Send the current pending request list to online Hosts and Moderators. |
+| `action_request_status` | Tell the requesting Participant whether their request is pending, approved, rejected, or cancelled. |
 | `assign_role` | Assign Moderator or Participant status. |
 | `remove_participant` | Remove a participant from the room. |
 | `transfer_host` | Transfer Host to an eligible, online participant. |
@@ -123,8 +130,6 @@ Playback changes are serialized per room before being broadcast to connected use
 client/
 ├── src/
 │   ├── components/       # Room form and YouTube player
-│   ├── context/          # Shared UI context
-│   ├── hooks/            # React hooks
 │   ├── pages/            # Home and watch-room pages
 │   ├── services/         # REST and Socket.IO clients
 │   ├── utils/            # Permissions and YouTube helpers
@@ -260,7 +265,7 @@ cd client
 npm run verify:realtime
 ```
 
-The script connects to MongoDB using `MONGODB_URI` from `server/.env` and tests the REST and Socket.IO flows, including playback synchronization and persistence, RBAC, late join, reconnect, participant removal, Host transfer, and session ending. It uses `http://localhost:5000` by default; set `VITE_API_URL` in the process environment to target another API. The script creates temporary room records and removes them when it finishes.
+The script connects to MongoDB using `MONGODB_URI` from `server/.env` and tests the REST and Socket.IO flows, including playback synchronization and persistence, RBAC, Participant action requests/approval/rejection, late join, reconnect, participant removal, Host transfer, and session ending. It uses `http://localhost:5000` by default; set `VITE_API_URL` in the process environment to target another API. The script creates temporary room records and removes them when it finishes.
 
 ## Assignment Compliance
 
@@ -276,6 +281,7 @@ The script connects to MongoDB using `MONGODB_URI` from `server/.env` and tests 
 | Host role | ✅ Implemented |
 | Moderator role | ✅ Implemented |
 | Participant role | ✅ Implemented |
+| Participant requests Host/Moderator approval for playback/video changes | ✅ Implemented |
 | Server-side RBAC | ✅ Implemented |
 | Role updates broadcast | ✅ Implemented |
 | Participant removal | ✅ Implemented |

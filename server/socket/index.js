@@ -1,4 +1,5 @@
 const { Server } = require("socket.io");
+const { randomUUID } = require("node:crypto");
 const mongoose = require("mongoose");
 const Room = require("../models/Room");
 const { ACTIONS, ROLES, canPerform, findParticipant } = require("../utils/roomAuth");
@@ -10,7 +11,10 @@ const persistenceTimers = new Map();
 const playbackQueues = new Map();
 const persistenceQueues = new Map();
 const membershipQueues = new Map();
+const pendingActionRequests = new Map();
 const VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
+const PLAYBACK_ACTIONS = new Set([ACTIONS.PLAY, ACTIONS.PAUSE, ACTIONS.SEEK, ACTIONS.CHANGE_VIDEO]);
+const MAX_PENDING_REQUESTS_PER_ROOM = 50;
 
 function enqueueByKey(queues, key, operation) {
   const previous = queues.get(key) || Promise.resolve();
@@ -104,6 +108,137 @@ function replyError(socket, ack, code, message) {
   if (typeof ack === "function") ack({ ok: false, error });
 }
 
+function playbackActionError(action, payload) {
+  if (!PLAYBACK_ACTIONS.has(action)) return { code: "INVALID_ACTION", message: "Choose a supported playback action." };
+  if (payload !== undefined && payload !== null && (typeof payload !== "object" || Array.isArray(payload))) {
+    return { code: "INVALID_PAYLOAD", message: "The playback request payload is invalid." };
+  }
+  if (action === ACTIONS.CHANGE_VIDEO && !VIDEO_ID_PATTERN.test(payload?.videoId || "")) {
+    return { code: "INVALID_VIDEO_ID", message: "Provide a valid YouTube video ID." };
+  }
+  if (action === ACTIONS.SEEK && (typeof payload?.time !== "number" || !Number.isFinite(payload.time) || payload.time < 0)) {
+    return { code: "INVALID_SEEK", message: "Seek time must be a finite, non-negative number." };
+  }
+  if ([ACTIONS.PLAY, ACTIONS.PAUSE].includes(action) && payload?.currentTime !== undefined
+    && (typeof payload.currentTime !== "number" || !Number.isFinite(payload.currentTime) || payload.currentTime < 0)) {
+    return { code: "INVALID_SEEK", message: "Playback time must be a finite, non-negative number." };
+  }
+  return null;
+}
+
+function requestsFor(roomCode) {
+  return [...(pendingActionRequests.get(roomCode)?.values() || [])].map((request) => ({
+    requestId: request.requestId,
+    userId: request.userId,
+    username: request.username,
+    action: request.action,
+    payload: request.payload,
+  }));
+}
+
+async function broadcastPendingRequests(io, roomCode) {
+  const room = await Room.findOne({ roomCode, sessionEndedAt: null });
+  const sockets = await io.in(roomCode).fetchSockets();
+  const requests = room ? requestsFor(roomCode) : [];
+  for (const recipient of sockets) {
+    const member = recipient.data.member;
+    const participant = member?.roomCode === roomCode ? findParticipant(room, member.userId) : null;
+    if (participant?.isOnline && canPerform(participant.role, ACTIONS.PLAY)) {
+      recipient.emit("pending_action_requests", requests);
+    }
+  }
+}
+
+function notifyRequestStatus(io, request, status) {
+  const requester = io.sockets.sockets.get(request.socketId);
+  if (requester?.connected && requester.data.member?.roomCode === request.roomCode
+    && requester.data.member?.userId === request.userId) {
+    requester.emit("action_request_status", { requestId: request.requestId, action: request.action, status });
+  }
+}
+
+async function removeRequestsForUser(io, roomCode, userId, status) {
+  const requests = pendingActionRequests.get(roomCode);
+  if (!requests) return;
+  for (const request of requests.values()) {
+    if (request.userId === userId) {
+      requests.delete(request.requestId);
+      notifyRequestStatus(io, request, status);
+    }
+  }
+  if (!requests.size) pendingActionRequests.delete(roomCode);
+  await broadcastPendingRequests(io, roomCode);
+}
+
+async function clearRoomRequests(io, roomCode, status) {
+  const requests = pendingActionRequests.get(roomCode);
+  if (requests) {
+    for (const request of requests.values()) notifyRequestStatus(io, request, status);
+    pendingActionRequests.delete(roomCode);
+  }
+  await broadcastPendingRequests(io, roomCode);
+}
+
+async function applyPlaybackAction(io, roomCode, userId, action, payload, requesterSession = null) {
+  const invalid = playbackActionError(action, payload);
+  if (invalid) return { ok: false, error: invalid };
+  const room = await Room.findOne({ roomCode, sessionEndedAt: null });
+  const actor = findParticipant(room, userId);
+  if (!room || !actor || !actor.isOnline) {
+    return { ok: false, error: { code: "NOT_IN_ROOM", message: "You are no longer an active room participant." } };
+  }
+  if (!canPerform(actor.role, action)) {
+    return { ok: false, error: { code: "FORBIDDEN", message: "Your room role does not allow this action." } };
+  }
+  if (requesterSession) {
+    const requesterSocket = io.sockets.sockets.get(requesterSession.socketId);
+    const requester = findParticipant(room, requesterSession.userId);
+    if (!requesterSocket?.connected || requesterSocket.data.member?.roomCode !== roomCode
+      || requesterSocket.data.member?.userId !== requesterSession.userId
+      || !requester?.isOnline || requester.role !== ROLES.PARTICIPANT) {
+      return { ok: false, error: { code: "STALE_REQUEST", message: "The requester is no longer an active Participant." } };
+    }
+  }
+
+  const state = stateFor(roomCode, room);
+  const now = Date.now();
+  if (action === ACTIONS.CHANGE_VIDEO) {
+    state.videoId = payload.videoId;
+    state.isPlaying = false;
+    state.currentTime = 0;
+  } else if (action === ACTIONS.SEEK) {
+    state.currentTime = payload.time;
+  } else {
+    state.currentTime = payload?.currentTime ?? effectiveTime(state, now);
+    state.isPlaying = action === ACTIONS.PLAY;
+  }
+  state.updatedAt = now;
+  queuePlaybackPersistence(roomCode, state, action !== ACTIONS.SEEK);
+  const response = snapshot(room, userId, state);
+  const { currentUser: _requester, ...sharedState } = response;
+  io.to(roomCode).emit("sync_state", sharedState);
+  return { ok: true, room: response };
+}
+
+function handlePlaybackRequest(socket, io, action, payload, ack) {
+  const member = socket.data.member;
+  if (mongoose.connection.readyState !== 1) return replyError(socket, ack, "DATABASE_UNAVAILABLE", "Room service is temporarily unavailable.");
+  if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before controlling playback.");
+  void enqueueByKey(playbackQueues, member.roomCode, async () => {
+    if (socket.data.member?.roomCode !== member.roomCode || socket.data.member?.userId !== member.userId) {
+      return replyError(socket, ack, "NOT_IN_ROOM", "You are no longer an active room participant.");
+    }
+    try {
+      const result = await applyPlaybackAction(io, member.roomCode, member.userId, action, payload);
+      if (!result.ok) return replyError(socket, ack, result.error.code, result.error.message);
+      if (typeof ack === "function") ack({ ok: true, room: result.room });
+    } catch (error) {
+      console.error(`Socket ${action} failed:`, error.name || "Error");
+      replyError(socket, ack, "ACTION_FAILED", "The room could not apply that action.");
+    }
+  });
+}
+
 async function disconnectMember(io, socket, member) {
   if (!member || mongoose.connection.readyState !== 1) return;
   try {
@@ -141,12 +276,14 @@ async function disconnectMember(io, socket, member) {
           persistenceTimers.delete(member.roomCode);
           const state = playbackCache.get(member.roomCode);
           if (state) { state.isPlaying = false; queuePlaybackPersistence(member.roomCode, state, true); }
+          await clearRoomRequests(io, member.roomCode, "session_ended");
           io.to(member.roomCode).emit("session_ended", { reason: "host_disconnected" });
         });
         return;
       }
       participant.isOnline = false;
       await room.save();
+      await enqueueByKey(playbackQueues, member.roomCode, () => removeRequestsForUser(io, member.roomCode, member.userId, "cancelled"));
       socket.to(member.roomCode).emit("user_left", {
         userId: participant.userId,
         participants: participantsFor(room),
@@ -186,6 +323,7 @@ async function endSession(io, roomCode, userId) {
     persistenceTimers.delete(roomCode);
     const state = playbackCache.get(roomCode);
     if (state) { state.isPlaying = false; queuePlaybackPersistence(roomCode, state, true); }
+    await clearRoomRequests(io, roomCode, "session_ended");
     io.to(roomCode).emit("session_ended", { reason: "host_ended" });
     return { ok: true };
   });
@@ -259,6 +397,7 @@ function initializeSocket(server, clientUrl) {
           participant: { userId: currentParticipant.userId, username: currentParticipant.username, role: currentParticipant.role },
           participants: roomState.participants,
         });
+        await broadcastPendingRequests(io, roomCode);
         if (typeof ack === "function") ack({ ok: true, room: roomState });
       } catch (error) {
         console.error("Socket room join failed:", error.name || "Error");
@@ -294,6 +433,113 @@ function initializeSocket(server, clientUrl) {
       } catch (error) {
         console.error("Could not end room session:", error.name || "Error");
         replyError(socket, ack, "END_SESSION_FAILED", "Could not end this watch party session.");
+      }
+    });
+
+    socket.on("request_action", async (payload, ack) => {
+      const member = socket.data.member;
+      if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before requesting a playback change.");
+      if (mongoose.connection.readyState !== 1) return replyError(socket, ack, "DATABASE_UNAVAILABLE", "Room service is temporarily unavailable.");
+      const invalid = playbackActionError(payload?.action, payload?.payload);
+      if (invalid) return replyError(socket, ack, invalid.code, invalid.message);
+
+      try {
+        const result = await enqueueByKey(playbackQueues, member.roomCode, async () => {
+          if (socket.data.member?.roomCode !== member.roomCode || socket.data.member?.userId !== member.userId) {
+            return { error: { code: "NOT_IN_ROOM", message: "You are no longer an active room participant." } };
+          }
+          const room = await Room.findOne({ roomCode: member.roomCode, sessionEndedAt: null });
+          const participant = findParticipant(room, member.userId);
+          if (!room || !participant?.isOnline) return { error: { code: "NOT_IN_ROOM", message: "You are no longer an active room participant." } };
+          if (participant.role !== ROLES.PARTICIPANT) {
+            return { error: { code: "FORBIDDEN", message: "Only Participants can request playback changes." } };
+          }
+          let requests = pendingActionRequests.get(member.roomCode);
+          if (!requests) {
+            requests = new Map();
+            pendingActionRequests.set(member.roomCode, requests);
+          }
+          if (requests.size >= MAX_PENDING_REQUESTS_PER_ROOM) {
+            return { error: { code: "REQUEST_LIMIT", message: "There are too many pending requests. Try again later." } };
+          }
+          const request = {
+            requestId: randomUUID(), roomCode: member.roomCode, userId: member.userId,
+            username: participant.username, socketId: socket.id, action: payload.action,
+            payload: payload.payload ? { ...payload.payload } : {},
+          };
+          requests.set(request.requestId, request);
+          await broadcastPendingRequests(io, member.roomCode);
+          socket.emit("action_request_status", { requestId: request.requestId, action: request.action, status: "pending" });
+          return { requestId: request.requestId };
+        });
+        if (result.error) return replyError(socket, ack, result.error.code, result.error.message);
+        if (typeof ack === "function") ack({ ok: true, requestId: result.requestId });
+      } catch (error) {
+        console.error("Could not create playback request:", error.name || "Error");
+        replyError(socket, ack, "REQUEST_FAILED", "Could not send this playback request.");
+      }
+    });
+
+    socket.on("resolve_action_request", async (payload, ack) => {
+      const member = socket.data.member;
+      if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before resolving playback requests.");
+      if (!payload || typeof payload.requestId !== "string" || !["approve", "reject"].includes(payload.decision)) {
+        return replyError(socket, ack, "INVALID_REQUEST", "Choose a valid request and approval decision.");
+      }
+      try {
+        const result = await enqueueByKey(playbackQueues, member.roomCode, async () => {
+          if (socket.data.member?.roomCode !== member.roomCode || socket.data.member?.userId !== member.userId) {
+            return { error: { code: "NOT_IN_ROOM", message: "You are no longer an active room participant." } };
+          }
+          const room = await Room.findOne({ roomCode: member.roomCode, sessionEndedAt: null });
+          const actor = findParticipant(room, member.userId);
+          if (!room || !actor?.isOnline) return { error: { code: "NOT_IN_ROOM", message: "You are no longer an active room participant." } };
+          if (!canPerform(actor.role, ACTIONS.PLAY)) {
+            return { error: { code: "FORBIDDEN", message: "Only the Host or a Moderator can resolve playback requests." } };
+          }
+          const requests = pendingActionRequests.get(member.roomCode);
+          const request = requests?.get(payload.requestId);
+          if (!request) return { error: { code: "STALE_REQUEST", message: "This request is no longer pending." } };
+          if (request.userId === member.userId) {
+            return { error: { code: "FORBIDDEN", message: "You cannot resolve your own request." } };
+          }
+          const requesterSocket = io.sockets.sockets.get(request.socketId);
+          const requester = findParticipant(room, request.userId);
+          if (!requesterSocket?.connected || requesterSocket.data.member?.roomCode !== member.roomCode
+            || requesterSocket.data.member?.userId !== request.userId
+            || !requester?.isOnline || requester.role !== ROLES.PARTICIPANT) {
+            requests.delete(request.requestId);
+            if (!requests.size) pendingActionRequests.delete(member.roomCode);
+            notifyRequestStatus(io, request, "cancelled");
+            await broadcastPendingRequests(io, member.roomCode);
+            return { error: { code: "STALE_REQUEST", message: "The requester is no longer an active Participant." } };
+          }
+
+          if (payload.decision === "reject") {
+            requests.delete(request.requestId);
+            if (!requests.size) pendingActionRequests.delete(member.roomCode);
+            notifyRequestStatus(io, request, "rejected");
+            await broadcastPendingRequests(io, member.roomCode);
+            return { requestId: request.requestId, decision: "reject" };
+          }
+
+          const applied = await applyPlaybackAction(io, member.roomCode, member.userId, request.action, request.payload, request);
+          requests.delete(request.requestId);
+          if (!requests.size) pendingActionRequests.delete(member.roomCode);
+          if (!applied.ok) {
+            notifyRequestStatus(io, request, "cancelled");
+            await broadcastPendingRequests(io, member.roomCode);
+            return { error: applied.error };
+          }
+          notifyRequestStatus(io, request, "approved");
+          await broadcastPendingRequests(io, member.roomCode);
+          return { requestId: request.requestId, decision: "approve" };
+        });
+        if (result.error) return replyError(socket, ack, result.error.code, result.error.message);
+        if (typeof ack === "function") ack({ ok: true, ...result });
+      } catch (error) {
+        console.error("Could not resolve playback request:", error.name || "Error");
+        replyError(socket, ack, "REQUEST_RESOLUTION_FAILED", "Could not resolve this playback request.");
       }
     });
 
@@ -346,6 +592,8 @@ function initializeSocket(server, clientUrl) {
         const participants = participantsFor(transferred);
         const newHost = participants.find((item) => item.userId === targetUserId);
         io.to(member.roomCode).emit("role_assigned", { participant: newHost, participants });
+        await removeRequestsForUser(io, member.roomCode, targetUserId, "cancelled");
+        await broadcastPendingRequests(io, member.roomCode);
         socket.data.member = null;
         await socket.leave(member.roomCode);
         if (typeof ack === "function") ack({ ok: true, participants });
@@ -355,72 +603,34 @@ function initializeSocket(server, clientUrl) {
       }
     });
 
-    for (const action of [ACTIONS.PLAY, ACTIONS.PAUSE, ACTIONS.SEEK, ACTIONS.CHANGE_VIDEO]) {
-      socket.on(action, (payload, ack) => {
-        const member = socket.data.member;
-        if (mongoose.connection.readyState !== 1) return replyError(socket, ack, "DATABASE_UNAVAILABLE", "Room service is temporarily unavailable.");
-        if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before controlling playback.");
-
-        void enqueueByKey(playbackQueues, member.roomCode, async () => {
-          try {
-            // A queued action is valid only while its original socket membership remains active.
-            if (socket.data.member?.roomCode !== member.roomCode || socket.data.member?.userId !== member.userId) {
-              return replyError(socket, ack, "NOT_IN_ROOM", "You are no longer an active room participant.");
-            }
-            const room = await Room.findOne({ roomCode: member.roomCode, sessionEndedAt: null });
-            const actor = findParticipant(room, member.userId);
-            if (!room || !actor || !actor.isOnline) return replyError(socket, ack, "NOT_IN_ROOM", "You are no longer an active room participant.");
-            if (!canPerform(actor.role, action)) return replyError(socket, ack, "FORBIDDEN", "Your room role does not allow this action.");
-
-            const state = stateFor(member.roomCode, room);
-            const now = Date.now();
-            if (action === ACTIONS.CHANGE_VIDEO) {
-              if (!VIDEO_ID_PATTERN.test(payload?.videoId || "")) return replyError(socket, ack, "INVALID_VIDEO_ID", "Provide a valid YouTube video ID.");
-              state.videoId = payload.videoId;
-              state.isPlaying = false;
-              state.currentTime = 0;
-            } else if (action === ACTIONS.SEEK) {
-              if (typeof payload?.time !== "number" || !Number.isFinite(payload.time) || payload.time < 0) {
-                return replyError(socket, ack, "INVALID_SEEK", "Seek time must be a finite, non-negative number.");
-              }
-              state.currentTime = payload.time;
-            } else {
-              if (payload?.currentTime !== undefined && (typeof payload.currentTime !== "number" || !Number.isFinite(payload.currentTime) || payload.currentTime < 0)) {
-                return replyError(socket, ack, "INVALID_SEEK", "Playback time must be a finite, non-negative number.");
-              }
-              state.currentTime = payload?.currentTime ?? effectiveTime(state, now);
-              state.isPlaying = action === ACTIONS.PLAY;
-            }
-            state.updatedAt = now;
-            queuePlaybackPersistence(member.roomCode, state, action !== ACTIONS.SEEK);
-            const response = snapshot(room, member.userId, state);
-            const { currentUser: _requester, ...sharedState } = response;
-            io.to(member.roomCode).emit("sync_state", sharedState);
-            if (typeof ack === "function") ack({ ok: true, room: response });
-          } catch (error) {
-            console.error(`Socket ${action} failed:`, error.name || "Error");
-            replyError(socket, ack, "ACTION_FAILED", "The room could not apply that action.");
-          }
-        });
-      });
-    }
+    socket.on("play", (payload, ack) => handlePlaybackRequest(socket, io, ACTIONS.PLAY, payload, ack));
+    socket.on("pause", (payload, ack) => handlePlaybackRequest(socket, io, ACTIONS.PAUSE, payload, ack));
+    socket.on("seek", (payload, ack) => handlePlaybackRequest(socket, io, ACTIONS.SEEK, payload, ack));
+    socket.on("change_video", (payload, ack) => handlePlaybackRequest(socket, io, ACTIONS.CHANGE_VIDEO, payload, ack));
 
     socket.on("assign_role", async (payload, ack) => {
+      const member = socket.data.member;
+      if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before changing participant roles.");
       try {
-        const member = socket.data.member;
-        if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before changing participant roles.");
-        const room = await Room.findOne({ roomCode: member.roomCode, sessionEndedAt: null }).select("+participants.sessionTokenHash");
-        const actor = findParticipant(room, member.userId);
-        if (!room || !actor || !actor.isOnline) return replyError(socket, ack, "NOT_IN_ROOM", "You are no longer an active room participant.");
-        if (!canPerform(actor.role, ACTIONS.ASSIGN_ROLE)) return replyError(socket, ack, "FORBIDDEN", "Only the host can assign participant roles.");
-        if (![ROLES.MODERATOR, ROLES.PARTICIPANT].includes(payload?.role)) return replyError(socket, ack, "INVALID_ROLE", "A participant can only be assigned Moderator or Participant.");
-        const target = findParticipant(room, payload?.userId);
-        if (!target || target.userId === room.hostId || target.role === ROLES.HOST) return replyError(socket, ack, "PARTICIPANT_NOT_FOUND", "That participant cannot be assigned a role.");
-        target.role = payload.role;
-        await room.save();
-        const update = { participant: { userId: target.userId, username: target.username, role: target.role }, participants: participantsFor(room) };
-        io.to(member.roomCode).emit("role_assigned", update);
-        if (typeof ack === "function") ack({ ok: true, ...update });
+        const result = await enqueueByKey(playbackQueues, member.roomCode, async () => {
+          if (socket.data.member?.userId !== member.userId) return { error: { code: "NOT_IN_ROOM", message: "You are no longer an active room participant." } };
+          const room = await Room.findOne({ roomCode: member.roomCode, sessionEndedAt: null }).select("+participants.sessionTokenHash");
+          const actor = findParticipant(room, member.userId);
+          if (!room || !actor || !actor.isOnline) return { error: { code: "NOT_IN_ROOM", message: "You are no longer an active room participant." } };
+          if (!canPerform(actor.role, ACTIONS.ASSIGN_ROLE)) return { error: { code: "FORBIDDEN", message: "Only the host can assign participant roles." } };
+          if (![ROLES.MODERATOR, ROLES.PARTICIPANT].includes(payload?.role)) return { error: { code: "INVALID_ROLE", message: "A participant can only be assigned Moderator or Participant." } };
+          const target = findParticipant(room, payload?.userId);
+          if (!target || target.userId === room.hostId || target.role === ROLES.HOST) return { error: { code: "PARTICIPANT_NOT_FOUND", message: "That participant cannot be assigned a role." } };
+          target.role = payload.role;
+          await room.save();
+          const update = { participant: { userId: target.userId, username: target.username, role: target.role }, participants: participantsFor(room) };
+          io.to(member.roomCode).emit("role_assigned", update);
+          if (target.role !== ROLES.PARTICIPANT) await removeRequestsForUser(io, member.roomCode, target.userId, "cancelled");
+          else await broadcastPendingRequests(io, member.roomCode);
+          return { update };
+        });
+        if (result.error) return replyError(socket, ack, result.error.code, result.error.message);
+        if (typeof ack === "function") ack({ ok: true, ...result.update });
       } catch (error) {
         console.error("Socket role assignment failed:", error.name || "Error");
         replyError(socket, ack, "ROLE_ASSIGN_FAILED", "Could not update that participant's role.");
@@ -428,29 +638,35 @@ function initializeSocket(server, clientUrl) {
     });
 
     socket.on("remove_participant", async (payload, ack) => {
+      const member = socket.data.member;
+      if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before removing participants.");
       try {
-        const member = socket.data.member;
-        if (!member) return replyError(socket, ack, "NOT_IN_ROOM", "Join a room before removing participants.");
-        const room = await Room.findOne({ roomCode: member.roomCode, sessionEndedAt: null }).select("+participants.sessionTokenHash");
-        const actor = findParticipant(room, member.userId);
-        if (!room || !actor || !actor.isOnline) return replyError(socket, ack, "NOT_IN_ROOM", "You are no longer an active room participant.");
-        if (!canPerform(actor.role, ACTIONS.REMOVE_PARTICIPANT)) return replyError(socket, ack, "FORBIDDEN", "Only the host can remove participants.");
-        const target = findParticipant(room, payload?.userId);
-        if (!target || target.userId === room.hostId || target.role === ROLES.HOST) return replyError(socket, ack, "PARTICIPANT_NOT_FOUND", "The host cannot be removed from the room.");
-        const removed = { userId: target.userId, username: target.username, role: target.role };
-        const targetIndex = room.participants.findIndex((person) => person.userId === target.userId);
-        room.participants.splice(targetIndex, 1);
-        await room.save();
-        const update = { ...removed, participants: participantsFor(room) };
-        io.to(member.roomCode).emit("participant_removed", update);
-        const connectedSockets = await io.in(member.roomCode).fetchSockets();
-        for (const connectedSocket of connectedSockets) {
-          if (connectedSocket.data.member?.userId === target.userId) {
-            connectedSocket.data.member = null;
-            setTimeout(() => connectedSocket.disconnect(true), 100);
+        const result = await enqueueByKey(playbackQueues, member.roomCode, async () => {
+          if (socket.data.member?.userId !== member.userId) return { error: { code: "NOT_IN_ROOM", message: "You are no longer an active room participant." } };
+          const room = await Room.findOne({ roomCode: member.roomCode, sessionEndedAt: null }).select("+participants.sessionTokenHash");
+          const actor = findParticipant(room, member.userId);
+          if (!room || !actor || !actor.isOnline) return { error: { code: "NOT_IN_ROOM", message: "You are no longer an active room participant." } };
+          if (!canPerform(actor.role, ACTIONS.REMOVE_PARTICIPANT)) return { error: { code: "FORBIDDEN", message: "Only the host can remove participants." } };
+          const target = findParticipant(room, payload?.userId);
+          if (!target || target.userId === room.hostId || target.role === ROLES.HOST) return { error: { code: "PARTICIPANT_NOT_FOUND", message: "The host cannot be removed from the room." } };
+          const removed = { userId: target.userId, username: target.username, role: target.role };
+          const targetIndex = room.participants.findIndex((person) => person.userId === target.userId);
+          room.participants.splice(targetIndex, 1);
+          await room.save();
+          const update = { ...removed, participants: participantsFor(room) };
+          io.to(member.roomCode).emit("participant_removed", update);
+          await removeRequestsForUser(io, member.roomCode, target.userId, "cancelled");
+          const connectedSockets = await io.in(member.roomCode).fetchSockets();
+          for (const connectedSocket of connectedSockets) {
+            if (connectedSocket.data.member?.userId === target.userId) {
+              connectedSocket.data.member = null;
+              setTimeout(() => connectedSocket.disconnect(true), 100);
+            }
           }
-        }
-        if (typeof ack === "function") ack({ ok: true, ...update });
+          return { update };
+        });
+        if (result.error) return replyError(socket, ack, result.error.code, result.error.message);
+        if (typeof ack === "function") ack({ ok: true, ...result.update });
       } catch (error) {
         console.error("Socket participant removal failed:", error.name || "Error");
         replyError(socket, ack, "REMOVE_FAILED", "Could not remove that participant.");
