@@ -6,6 +6,9 @@ require(path.join(serverRoot, "node_modules", "dotenv")).config({ path: path.joi
 const mongoose = require(path.join(serverRoot, "node_modules", "mongoose"));
 const Room = require(path.join(serverRoot, "models", "Room.js"));
 const { io } = require("socket.io-client");
+const http = require("node:http");
+const initializeSocket = require(path.join(serverRoot, "socket"));
+const { createSession } = require(path.join(serverRoot, "utils", "sessionTokens"));
 
 const API = process.env.VITE_API_URL || `http://localhost:${process.env.PORT || 5000}`;
 const sockets = [];
@@ -42,7 +45,7 @@ async function request(pathname, body, token) {
   return { status: response.status, body: await response.json() };
 }
 
-async function connectMember(roomCode, sessionToken) {
+async function connectMember(roomCode, sessionToken, capturePendingRequests = false) {
   const socket = io(API, { autoConnect: false, transports: ["websocket"] });
   sockets.push(socket);
   await new Promise((resolve, reject) => {
@@ -52,9 +55,12 @@ async function connectMember(roomCode, sessionToken) {
     socket.connect();
   });
   const syncPromise = nextEvent(socket, "sync_state");
+  const pendingRequestsPromise = capturePendingRequests
+    ? new Promise((resolve) => socket.once("pending_action_requests", resolve))
+    : null;
   const result = await emitAck(socket, "join_room", { roomCode, sessionToken });
   assert.equal(result.ok, true, result.error?.message || "Socket join failed.");
-  return { socket, initialSync: await syncPromise };
+  return { socket, initialSync: await syncPromise, pendingRequestsPromise };
 }
 
 async function connectBareSocket() {
@@ -67,6 +73,92 @@ async function connectBareSocket() {
     socket.connect();
   });
   return socket;
+}
+
+async function verifyFailedHostReconnectPersistence() {
+  const roomCode = `FAIL-${require("node:crypto").randomBytes(4).toString("hex").toUpperCase()}`;
+  const hostSession = createSession();
+  const guestSession = createSession();
+  await Room.create({
+    roomCode,
+    hostId: hostSession.userId,
+    currentVideoId: "dQw4w9WgXcQ",
+    participants: [
+      { userId: hostSession.userId, username: "Persistence Host", role: "host", sessionTokenHash: hostSession.tokenHash, isOnline: true },
+      { userId: guestSession.userId, username: "Persistence Guest", role: "participant", sessionTokenHash: guestSession.tokenHash, isOnline: true },
+    ],
+  });
+  testRoomCodes.push(roomCode);
+
+  const server = http.createServer();
+  const socketServer = initializeSocket(server, "*");
+  const localSockets = [];
+  let originalSave;
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    const localApi = `http://127.0.0.1:${address.port}`;
+    const joinLocalMember = async (session) => {
+      const socket = io(localApi, { autoConnect: false, transports: ["websocket"] });
+      localSockets.push(socket);
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Timed out connecting to the isolated Socket.IO server.")), 6000);
+        socket.once("connect", () => { clearTimeout(timer); resolve(); });
+        socket.once("connect_error", (error) => { clearTimeout(timer); reject(error); });
+        socket.connect();
+      });
+      const syncState = nextEvent(socket, "sync_state");
+      const result = await emitAck(socket, "join_room", { roomCode, sessionToken: session.token });
+      assert.equal(result.ok, true, result.error?.message || "Isolated socket join failed.");
+      await syncState;
+      return socket;
+    };
+
+    await joinLocalMember(hostSession);
+    const guest = await joinLocalMember(guestSession);
+    const ended = nextEvent(guest, "session_ended", 15000);
+    localSockets[0].disconnect();
+    await delay(150);
+
+    originalSave = Room.prototype.save;
+    let injectedFailure = false;
+    Room.prototype.save = function saveWithOneInjectedJoinFailure(...args) {
+      if (!injectedFailure && this.roomCode === roomCode) {
+        injectedFailure = true;
+        return Promise.reject(new Error("Injected participant persistence failure"));
+      }
+      return originalSave.apply(this, args);
+    };
+
+    const failedReplacement = io(localApi, { autoConnect: false, transports: ["websocket"] });
+    localSockets.push(failedReplacement);
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("Timed out connecting the replacement Host socket.")), 6000);
+      failedReplacement.once("connect", () => { clearTimeout(timer); resolve(); });
+      failedReplacement.once("connect_error", (error) => { clearTimeout(timer); reject(error); });
+      failedReplacement.connect();
+    });
+    const failedJoin = await emitAck(failedReplacement, "join_room", { roomCode, sessionToken: hostSession.token });
+    assert.equal(failedJoin.ok, false, "Injected persistence failure must reject replacement Host join.");
+    assert.equal(failedJoin.error.code, "JOIN_FAILED");
+    assert.equal(injectedFailure, true, "The test must exercise the Host membership persistence failure.");
+    Room.prototype.save = originalSave;
+    originalSave = null;
+
+    assert.equal((await ended).reason, "host_disconnected",
+      "The original grace timer must remain armed after replacement membership persistence fails.");
+    const persistedRoom = await Room.findOne({ roomCode });
+    assert.ok(persistedRoom.sessionEndedAt, "Failed reconnect must still receive timeout session cleanup.");
+    assert.equal(persistedRoom.participants.find((person) => person.userId === hostSession.userId).isOnline, false);
+  } finally {
+    if (originalSave) Room.prototype.save = originalSave;
+    for (const socket of localSockets) socket.disconnect();
+    await new Promise((resolve) => socketServer.close(() => resolve()));
+    if (server.listening) await new Promise((resolve) => server.close(resolve));
+  }
 }
 
 async function run() {
@@ -478,12 +570,68 @@ async function run() {
   assert.equal(endedReconnect.ok, false, "Participants cannot reconnect into an ended session.");
   assert.equal(endedReconnect.error.code, "SESSION_ENDED");
 
-  // A host disconnect ends the session only after the existing reconnect check;
-  // ordinary non-host leave/disconnect above leaves the room active.
+  // Browser reloads disconnect a socket before the replacement connects. Host
+  // reconnection must preserve role, pending requests, and authoritative playback.
+  const reloadRoom = await makeRoom("Reloading Host");
+  const reloadParticipant = await makeGuest(reloadRoom.code, "Reloading Participant");
+  const reloadModerator = await makeGuest(reloadRoom.code, "Reloading Moderator");
+  assert.equal((await emitAck(reloadRoom.host.socket, "assign_role", {
+    userId: reloadModerator.initialSync.currentUser.userId, role: "moderator",
+  })).ok, true);
+  assert.equal((await emitAck(reloadRoom.host.socket, "play", { currentTime: 14 })).ok, true,
+    "Host reload playing setup must succeed.");
+  const requestDuringHostReload = await emitAck(reloadParticipant.socket, "request_action", {
+    action: "seek", payload: { time: 26 },
+  });
+  assert.equal(requestDuringHostReload.ok, true);
+  const hostEndedDuringReload = { value: false };
+  reloadParticipant.socket.on("session_ended", () => { hostEndedDuringReload.value = true; });
+  reloadRoom.host.socket.disconnect();
+  await delay(150);
+  assert.equal((await request(`/api/rooms/${reloadRoom.code}`)).body.room.sessionEnded, false,
+    "A temporary Host disconnect must not immediately end the session.");
+  const reloadedHost = await connectMember(reloadRoom.code, reloadRoom.token, true);
+  reloadRoom.host = reloadedHost;
+  assert.equal(reloadedHost.initialSync.currentUser.role, "host", "Host reload must preserve the Host role.");
+  assert.equal(reloadedHost.initialSync.playbackState, "playing", "Host reload must restore playing state.");
+  assert.ok(reloadedHost.initialSync.currentTime >= 14, "Host reload must restore the authoritative playback position.");
+  assert.ok((await reloadedHost.pendingRequestsPromise)
+    .some((item) => item.requestId === requestDuringHostReload.requestId),
+  "Pending Participant requests must remain available to the reconnected Host.");
+  assert.equal(hostEndedDuringReload.value, false, "Other users must not receive session_ended during Host reload.");
+  const pauseForReload = await emitAck(reloadedHost.socket, "pause", { currentTime: 32 });
+  assert.equal(pauseForReload.ok, true, "Paused Host reload setup must succeed.");
+  reloadedHost.socket.disconnect();
+  await delay(100);
+  const reloadedPausedHost = await connectMember(reloadRoom.code, reloadRoom.token);
+  reloadRoom.host = reloadedPausedHost;
+  assert.equal(reloadedPausedHost.initialSync.currentUser.role, "host");
+  assert.equal(reloadedPausedHost.initialSync.playbackState, "paused", "Host reload must restore paused state.");
+  assert.equal(reloadedPausedHost.initialSync.currentTime, 32);
+
+  reloadParticipant.socket.disconnect();
+  const reloadedParticipant = await connectMember(reloadRoom.code, reloadParticipant.token);
+  assert.equal(reloadedParticipant.initialSync.currentUser.role, "participant", "Participant reload must preserve role.");
+  reloadModerator.socket.disconnect();
+  const reloadedModerator = await connectMember(reloadRoom.code, reloadModerator.token);
+  assert.equal(reloadedModerator.initialSync.currentUser.role, "moderator", "Moderator reload must preserve role.");
+  assert.equal((await request(`/api/rooms/${reloadRoom.code}`)).body.room.sessionEnded, false,
+    "Participant and Moderator reloads must leave the room active.");
+
+  // A Host who does not reconnect within the grace window still ends the room.
   const disconnectedHostRoom = await makeRoom("Disconnecting Host");
   const disconnectGuest = await makeGuest(disconnectedHostRoom.code, "Disconnect Host Guest");
-  const disconnectEndedNotice = nextEvent(disconnectGuest.socket, "session_ended");
+  const disconnectEndedNotice = nextEvent(disconnectGuest.socket, "session_ended", 15000);
   disconnectedHostRoom.host.socket.disconnect();
+  const unrelatedHostJoin = await connectBareSocket();
+  const unrelatedSessionAttempt = await emitAck(unrelatedHostJoin, "join_room", {
+    roomCode: disconnectedHostRoom.code, sessionToken: reloadRoom.token,
+  });
+  assert.equal(unrelatedSessionAttempt.ok, false, "A different Host session cannot join using another Host's room code.");
+  assert.equal(unrelatedSessionAttempt.error.code, "ROOM_NOT_FOUND");
+  await delay(150);
+  assert.equal((await request(`/api/rooms/${disconnectedHostRoom.code}`)).body.room.sessionEnded, false,
+    "A disconnected Host session must remain recoverable during the reconnect grace window.");
   assert.equal((await disconnectEndedNotice).reason, "host_disconnected");
   const disconnectedHostJoin = await connectBareSocket();
   const rejectedOldHost = await emitAck(disconnectedHostJoin, "join_room", {
@@ -491,6 +639,10 @@ async function run() {
   });
   assert.equal(rejectedOldHost.ok, false, "Old Host cannot revive a disconnected ended session.");
   assert.equal(rejectedOldHost.error.code, "SESSION_ENDED");
+
+  await verifyFailedHostReconnectPersistence();
+  assert.equal((await request(`/api/rooms/${reloadRoom.code}`)).body.room.sessionEnded, false,
+    "A successfully reconnected Host session must remain active beyond another Host's grace timeout.");
 
   console.log("Realtime integration passed: RBAC, Participant action requests and Host/Moderator approval, rejection and stale-request handling, manual Host transfer, explicit/disconnected Host session end, reconnect rejection, normal participant/moderator leave, playback ordering/persistence, removal, and reconnect race protection.");
 }

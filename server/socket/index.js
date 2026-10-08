@@ -12,9 +12,11 @@ const playbackQueues = new Map();
 const persistenceQueues = new Map();
 const membershipQueues = new Map();
 const pendingActionRequests = new Map();
+const hostDisconnectTimers = new Map();
 const VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
 const PLAYBACK_ACTIONS = new Set([ACTIONS.PLAY, ACTIONS.PAUSE, ACTIONS.SEEK, ACTIONS.CHANGE_VIDEO]);
 const MAX_PENDING_REQUESTS_PER_ROOM = 50;
+const HOST_RECONNECT_GRACE_MS = 10000;
 
 function enqueueByKey(queues, key, operation) {
   const previous = queues.get(key) || Promise.resolve();
@@ -28,6 +30,13 @@ function enqueueByKey(queues, key, operation) {
 
 function membershipKey(roomCode, userId) {
   return `${roomCode}:${userId}`;
+}
+
+function clearHostDisconnectTimer(roomCode, userId) {
+  const key = membershipKey(roomCode, userId);
+  const timer = hostDisconnectTimers.get(key);
+  if (timer) clearTimeout(timer);
+  hostDisconnectTimers.delete(key);
 }
 
 function withMembershipLocks(roomCode, userIds, operation) {
@@ -179,6 +188,50 @@ async function clearRoomRequests(io, roomCode, status) {
   await broadcastPendingRequests(io, roomCode);
 }
 
+function deferHostDisconnectEnd(io, member) {
+  const key = membershipKey(member.roomCode, member.userId);
+  clearHostDisconnectTimer(member.roomCode, member.userId);
+  const timer = setTimeout(() => {
+    void enqueueByKey(membershipQueues, key, async () => {
+      if (hostDisconnectTimers.get(key) !== timer) return;
+      hostDisconnectTimers.delete(key);
+      const roomSockets = await io.in(member.roomCode).fetchSockets();
+      if (roomSockets.some((candidate) => candidate.data.member?.roomCode === member.roomCode
+        && candidate.data.member?.userId === member.userId)) return;
+
+      await enqueueByKey(playbackQueues, member.roomCode, async () => {
+        const activeRoom = await Room.findOne({
+          roomCode: member.roomCode,
+          hostId: member.userId,
+          sessionEndedAt: null,
+          participants: { $elemMatch: { userId: member.userId, role: ROLES.HOST, isOnline: true } },
+        });
+        const activeHost = findParticipant(activeRoom, member.userId);
+        if (!activeRoom || !activeHost) return;
+        const currentSockets = await io.in(member.roomCode).fetchSockets();
+        if (currentSockets.some((candidate) => candidate.data.member?.roomCode === member.roomCode
+          && candidate.data.member?.userId === member.userId)) return;
+
+        activeRoom.sessionEndedAt = new Date();
+        activeRoom.sessionEndReason = "host_disconnected";
+        activeRoom.isPlaying = false;
+        activeHost.isOnline = false;
+        await activeRoom.save();
+        const playbackTimer = persistenceTimers.get(member.roomCode);
+        if (playbackTimer) clearTimeout(playbackTimer);
+        persistenceTimers.delete(member.roomCode);
+        const state = playbackCache.get(member.roomCode);
+        if (state) { state.isPlaying = false; queuePlaybackPersistence(member.roomCode, state, true); }
+        await clearRoomRequests(io, member.roomCode, "session_ended");
+        io.to(member.roomCode).emit("session_ended", { reason: "host_disconnected" });
+      });
+    }).catch((error) => {
+      console.error("Could not finalize disconnected Host session:", error.name || "Error");
+    });
+  }, HOST_RECONNECT_GRACE_MS);
+  hostDisconnectTimers.set(key, timer);
+}
+
 async function applyPlaybackAction(io, roomCode, userId, action, payload, requesterSession = null) {
   const invalid = playbackActionError(action, payload);
   if (invalid) return { ok: false, error: invalid };
@@ -262,23 +315,7 @@ async function disconnectMember(io, socket, member) {
         return;
       }
       if (room.hostId === participant.userId && participant.role === ROLES.HOST) {
-        await enqueueByKey(playbackQueues, member.roomCode, async () => {
-          const activeRoom = await Room.findOne({ roomCode: member.roomCode, hostId: member.userId, sessionEndedAt: null });
-          const activeHost = findParticipant(activeRoom, member.userId);
-          if (!activeRoom || !activeHost || activeHost.role !== ROLES.HOST) return;
-          activeRoom.sessionEndedAt = new Date();
-          activeRoom.sessionEndReason = "host_disconnected";
-          activeRoom.isPlaying = false;
-          activeHost.isOnline = false;
-          await activeRoom.save();
-          const timer = persistenceTimers.get(member.roomCode);
-          if (timer) clearTimeout(timer);
-          persistenceTimers.delete(member.roomCode);
-          const state = playbackCache.get(member.roomCode);
-          if (state) { state.isPlaying = false; queuePlaybackPersistence(member.roomCode, state, true); }
-          await clearRoomRequests(io, member.roomCode, "session_ended");
-          io.to(member.roomCode).emit("session_ended", { reason: "host_disconnected" });
-        });
+        deferHostDisconnectEnd(io, member);
         return;
       }
       participant.isOnline = false;
@@ -388,6 +425,9 @@ function initializeSocket(server, clientUrl) {
             await socket.leave(roomCode);
             throw error;
           }
+          // Preserve the reconnect grace timer until room membership has been
+          // persisted and the replacement socket has joined successfully.
+          clearHostDisconnectTimer(roomCode, currentParticipant.userId);
           return { room: currentRoom, participant: currentParticipant, state: snapshot(currentRoom, currentParticipant.userId) };
         });
         if (joined.error) return replyError(socket, ack, joined.error[0], joined.error[1]);
