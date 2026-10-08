@@ -218,12 +218,70 @@ Backend variables are configured in Render; configure `VITE_API_URL` in Vercel. 
 
 Set the backend's `CLIENT_URL` to the deployed frontend origin and the frontend's `VITE_API_URL` to the backend URL. The backend health endpoint is [`/api/health`](https://youtube-watch-party-nmgj.onrender.com/api/health).
 
-## Useful checks
+## Production Verification
+
+The deployed application was verified for the following behaviors:
+
+- REST API and CORS
+- MongoDB persistence
+- Socket.IO connection
+- Play, pause, and seek synchronization
+- Change video
+- Late join
+- Host, Moderator, and Participant RBAC
+- Participant removal
+- Host transfer
+- End Session
+- Reconnect behavior
+- Direct `/room/<roomCode>` refresh
+- Ended-room refresh
+
+## Testing
+
+Run each command from the indicated directory.
+
+### Backend: MongoDB connectivity
+
+From the repository root:
 
 ```bash
-# Check MongoDB connectivity (run from server/)
+cd server
 npm run check:db
+```
 
-# Run the realtime verification script (run from client/)
+This checks that the MongoDB URI configured in `server/.env` can connect.
+
+### Client: realtime integration verification
+
+From the repository root:
+
+```bash
+cd client
 npm run verify:realtime
 ```
+
+The script connects to MongoDB using `MONGODB_URI` from `server/.env` and tests the REST and Socket.IO flows, including playback synchronization and persistence, RBAC, late join, reconnect, participant removal, Host transfer, and session ending. It uses `http://localhost:5000` by default; set `VITE_API_URL` in the process environment to target another API. The script creates temporary room records and removes them when it finishes.
+
+## Assignment Compliance
+
+| Assignment requirement | Status |
+|---|:---:|
+| Room creation | ✅ Implemented |
+| Room joining | ✅ Implemented |
+| Unique room code/link | ✅ Implemented |
+| YouTube integration | ✅ Implemented |
+| Play/pause/seek synchronization | ✅ Implemented |
+| Change video | ✅ Implemented |
+| Socket.IO/WebSockets | ✅ Implemented |
+| Host role | ✅ Implemented |
+| Moderator role | ✅ Implemented |
+| Participant role | ✅ Implemented |
+| Server-side RBAC | ✅ Implemented |
+| Role updates broadcast | ✅ Implemented |
+| Participant removal | ✅ Implemented |
+| Host transfer | ✅ Implemented |
+| Session ending | ✅ Implemented |
+| Production deployment | ✅ Implemented |
+| Public frontend | ✅ Implemented |
+| Backend deployment | ✅ Implemented |
+| Documentation | ✅ Implemented |
